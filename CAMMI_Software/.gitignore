@@ -1,0 +1,68 @@
+# ==========================================
+# PlatformIO Build & Environment
+# ==========================================
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ==========================================
+# ESP-IDF (v6+) Configuration & Artifacts
+# ==========================================
+# Keep your main 'sdkconfig' or 'sdkconfig.defaults' tracked, 
+# but ignore backups and auto-generated CMake/header files.
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.cmake
+sdkconfig.json
+sdkconfig.h
+build/
+managed_components/
+dependencies.lock
+
+# ==========================================
+# IDEs & Editors
+# ==========================================
+# VS Code (Comment out .vscode/ if you share custom tasks/extensions with a team)
+.vscode/
+!.vscode/extensions.json
+
+# CLion / JetBrains
+.idea/
+cmake-build-*/
+
+# Sublime / Vim / Other
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Python (ESP-IDF / PlatformIO scripts)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# ==========================================
+# OS Generated Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ==========================================
+# Secrets & Local Overrides
+# ==========================================
+# Optional: if you store Wi-Fi credentials or certs in local headers
+*secrets.h
+*.pem
+*.key
+
+# Made with gemini. Chat log: https://share.gemini.google/X2PIwCgu6ipu
