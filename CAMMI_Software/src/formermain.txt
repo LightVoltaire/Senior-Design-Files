@@ -1,0 +1,521 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+
+// Bare-metal GPSPI2 & GPIO Matrix headers (Academic Constraint: no spi_master.h)
+#include "soc/soc.h"
+#include "soc/spi_reg.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/periph_defs.h"
+#include "hal/gpio_hal.h"
+#include "esp_private/periph_ctrl.h"
+#include "driver/gpio.h"
+
+// ESP-IDF v6+ I2C Master, esp_lcd SSD1306, and ADC Oneshot
+#include "driver/i2c_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_ssd1306.h"
+#include "esp_adc/adc_oneshot.h"
+
+static const char *TAG = "AIR_MOUSE_DEMO";
+
+/* =========================================================================
+ * 1. PIN DEFINITIONS (Verify Joystick ADC & MISO before flashing)
+ * ========================================================================= */
+// MPU6500 (GPSPI2)
+#define PIN_IMU_INT         GPIO_NUM_9
+#define PIN_IMU_NCS         GPIO_NUM_10
+#define PIN_IMU_MOSI        GPIO_NUM_11     // Module SDA / SDI
+#define PIN_IMU_SCLK        GPIO_NUM_12     // Module SCL / SCLK
+#define PIN_IMU_MISO        GPIO_NUM_13     // Module AD0 / SDO (Standard FSPIQ)
+
+// SSD1306 128x64 OLED (I2C0)
+#define PIN_OLED_SDA        GPIO_NUM_4
+#define PIN_OLED_SCL        GPIO_NUM_5
+#define OLED_I2C_ADDR       0x3C
+
+// Power-Gated Analog Joystick & Mode Switch
+// NOTE: GPIO38 on ESP32-S3 has no ADC channel; GPIO1 (ADC1_CH0) is used here.
+#define PIN_JOY_VCC_GATE    GPIO_NUM_2      // Switched VCC rail (50 us pulse)
+#define JOY_ADC_UNIT        ADC_UNIT_1
+#define JOY_ADC_CHANNEL     ADC_CHANNEL_0   // GPIO1
+#define PIN_JOY_SW          GPIO_NUM_41     // Active/Typing mode toggle button
+
+/* =========================================================================
+ * 2. MPU6500 REGISTERS
+ * ========================================================================= */
+#define MPU_REG_SMPLRT_DIV      0x19
+#define MPU_REG_CONFIG          0x1A
+#define MPU_REG_GYRO_CONFIG     0x1B
+#define MPU_REG_ACCEL_CONFIG    0x1C
+#define MPU_REG_INT_PIN_CFG     0x37
+#define MPU_REG_INT_ENABLE      0x38
+#define MPU_REG_ACCEL_XOUT_H    0x3B
+#define MPU_REG_USER_CTRL       0x6A
+#define MPU_REG_PWR_MGMT_1      0x6B
+#define MPU_REG_WHO_AM_I        0x75
+#define MPU_WHO_AM_I_VAL        0x70
+
+/* =========================================================================
+ * 3. SHARED IPC STATE (Decoupled Spinlock Accumulator)
+ * ========================================================================= */
+typedef struct {
+    float pitch_deg;
+    float roll_deg;
+    int32_t acc_dx;
+    int32_t acc_dy;
+    int8_t scroll_y;
+    bool active_mode;       // true = Air Mouse Active, false = Typing Locked
+    uint8_t who_am_i;
+    uint32_t drdy_count;
+} system_state_t;
+
+static portMUX_TYPE s_state_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static system_state_t s_state = { .active_mode = true };
+static TaskHandle_t s_imu_task_handle = NULL;
+static esp_lcd_panel_handle_t s_oled_panel = NULL;
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+
+/* =========================================================================
+ * 4. BARE-METAL GPSPI2 REGISTER DRIVER (ESP32-S3)
+ * ========================================================================= */
+static void gpspi2_baremetal_init(void)
+{
+    // Enable SPI2 peripheral clock & release reset
+    periph_module_enable(PERIPH_SPI2_MODULE);
+    periph_module_reset(PERIPH_SPI2_MODULE);
+
+    // Configure nCS manually as GPIO output (high = idle) for clean multi-byte bursts
+    gpio_config_t cs_cfg = {
+        .pin_bit_mask = (1ULL << PIN_IMU_NCS),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&cs_cfg);
+    gpio_set_level(PIN_IMU_NCS, 1);
+
+    // Configure SCLK, MOSI (outputs) and MISO (input) via GPIO Matrix
+    gpio_set_direction(PIN_IMU_SCLK, GPIO_MODE_OUTPUT);
+    gpio_set_direction(PIN_IMU_MOSI, GPIO_MODE_OUTPUT);
+    gpio_set_direction(PIN_IMU_MISO, GPIO_MODE_INPUT);
+
+    esp_rom_gpio_connect_out_signal(PIN_IMU_SCLK, FSPICLK_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal(PIN_IMU_MOSI, FSPID_OUT_IDX, false, false);
+    esp_rom_gpio_connect_in_signal(PIN_IMU_MISO, FSPIQ_IN_IDX, false);
+
+    // Configure GPSPI2 Clock: 80 MHz APB / (8 * 10) = 1 MHz safe bring-up clock
+    // Clear SPI_CLK_EQU_SYSCLK; set CLKCNT_N=9, CLKCNT_H=4, CLKCNT_L=9, CLKDIV_PRE=7
+    REG_WRITE(SPI_CLOCK_REG(2),
+              (7 << SPI_CLKDIV_PRE_S) |
+              (9 << SPI_CLKCNT_N_S)   |
+              (4 << SPI_CLKCNT_H_S)   |
+              (9 << SPI_CLKCNT_L_S));
+
+    // SPI Mode 0 (CPOL=0, CPHA=0), Full-duplex, MSB-first
+    REG_WRITE(SPI_MISC_REG(2), 0);
+    REG_WRITE(SPI_USER_REG(2), SPI_USR_MOSI | SPI_USR_MISO | SPI_DOUTDIN);
+    REG_WRITE(SPI_USER1_REG(2), 0);
+    REG_WRITE(SPI_USER2_REG(2), 0);
+    REG_WRITE(SPI_SLAVE_REG(2), 0);
+
+    // Synchronize internal SPI clock domains
+    REG_SET_BIT(SPI_CMD_REG(2), SPI_UPDATE);
+    while (REG_GET_BIT(SPI_CMD_REG(2), SPI_UPDATE)) {
+        // wait for update bit self-clear
+    }
+}
+
+static void gpspi2_transfer_bytes(const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    if (len == 0 || len > 64) return;
+
+    gpio_set_level(PIN_IMU_NCS, 0);
+
+    // Load TX data into SPI_W0_REG .. SPI_W15_REG (32-bit words)
+    uint32_t words = (len + 3) / 4;
+    for (uint32_t w = 0; w < words; w++) {
+        uint32_t word_val = 0;
+        for (size_t b = 0; b < 4 && (w * 4 + b) < len; b++) {
+            uint8_t byte = tx ? tx[w * 4 + b] : 0x00;
+            word_val |= ((uint32_t)byte) << (b * 8);
+        }
+        REG_WRITE(SPI_W0_REG(2) + (w * 4), word_val);
+    }
+
+    // Set bit length (len * 8 - 1) for both MOSI and MISO
+    uint32_t bitlen = (len * 8) - 1;
+    REG_WRITE(SPI_MS_DLEN_REG(2), bitlen);
+
+    // Trigger SPI user transaction and poll SPI_USR busy bit
+    REG_SET_BIT(SPI_CMD_REG(2), SPI_USR);
+    while (REG_GET_BIT(SPI_CMD_REG(2), SPI_USR)) {
+        // busy wait (~15 us for 15 bytes at 8 MHz, ~120 us at 1 MHz)
+    }
+
+    // Read RX data from SPI_W0_REG .. SPI_W15_REG
+    if (rx) {
+        for (uint32_t w = 0; w < words; w++) {
+            uint32_t word_val = REG_READ(SPI_W0_REG(2) + (w * 4));
+            for (size_t b = 0; b < 4 && (w * 4 + b) < len; b++) {
+                rx[w * 4 + b] = (uint8_t)((word_val >> (b * 8)) & 0xFF);
+            }
+        }
+    }
+
+    gpio_set_level(PIN_IMU_NCS, 1);
+}
+
+static void mpu6500_write_reg(uint8_t reg, uint8_t val)
+{
+    uint8_t tx[2] = { (uint8_t)(reg & 0x7F), val };
+    gpspi2_transfer_bytes(tx, NULL, 2);
+}
+
+static uint8_t mpu6500_read_reg(uint8_t reg)
+{
+    uint8_t tx[2] = { (uint8_t)(reg | 0x80), 0x00 };
+    uint8_t rx[2] = { 0 };
+    gpspi2_transfer_bytes(tx, rx, 2);
+    return rx[1];
+}
+
+static void mpu6500_read_burst(uint8_t start_reg, uint8_t *buf, size_t len)
+{
+    uint8_t tx[16] = { 0 };
+    uint8_t rx[16] = { 0 };
+    tx[0] = start_reg | 0x80;
+    gpspi2_transfer_bytes(tx, rx, len + 1);
+    memcpy(buf, &rx[1], len);
+}
+
+/* =========================================================================
+ * 5. MPU6500 INITIALIZATION & DRDY ISR
+ * ========================================================================= */
+static void IRAM_ATTR mpu_drdy_isr(void *arg)
+{
+    BaseType_t hp_task_woken = pdFALSE;
+    if (s_imu_task_handle != NULL) {
+        vTaskNotifyGiveFromISR(s_imu_task_handle, &hp_task_woken);
+        portYIELD_FROM_ISR(hp_task_woken);
+    }
+}
+
+static esp_err_t mpu6500_init(void)
+{
+    // Reset device & disable I2C slave interface immediately (I2C_IF_DIS = 0x10)
+    mpu6500_write_reg(MPU_REG_PWR_MGMT_1, 0x80);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    mpu6500_write_reg(MPU_REG_PWR_MGMT_1, 0x01);  // Auto-select best PLL clock
+    mpu6500_write_reg(MPU_REG_USER_CTRL,  0x10);  // I2C_IF_DIS = 1 (SPI-only mode)
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    uint8_t who = mpu6500_read_reg(MPU_REG_WHO_AM_I);
+    ESP_LOGI(TAG, "MPU6500 WHO_AM_I = 0x%02X (expected 0x70)", who);
+    s_state.who_am_i = who;
+    if (who != MPU_WHO_AM_I_VAL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // Configure DLPF (~41 Hz), Gyro +-500 dps (0x08), Accel +-4g (0x08)
+    // Sample Rate = 1000 Hz / (1 + SMPLRT_DIV) -> SMPLRT_DIV = 1 => 500 Hz
+    mpu6500_write_reg(MPU_REG_CONFIG,       0x03);
+    mpu6500_write_reg(MPU_REG_SMPLRT_DIV,   0x01);
+    mpu6500_write_reg(MPU_REG_GYRO_CONFIG,  0x08);
+    mpu6500_write_reg(MPU_REG_ACCEL_CONFIG, 0x08);
+
+    // Configure INT pin: Active-High, Push-Pull, 50us Pulse, Clear-on-any-read (0x10)
+    mpu6500_write_reg(MPU_REG_INT_PIN_CFG,  0x10);
+    mpu6500_write_reg(MPU_REG_INT_ENABLE,   0x01); // RAW_RDY_EN
+
+    // Attach rising-edge GPIO interrupt on PIN_IMU_INT
+    gpio_config_t int_cfg = {
+        .pin_bit_mask = (1ULL << PIN_IMU_INT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    gpio_config(&int_cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_IMU_INT, mpu_drdy_isr, NULL);
+
+    return ESP_OK;
+}
+
+/* =========================================================================
+ * 6. CORE 1 REAL-TIME IMU TASK (Prio 10)
+ * ========================================================================= */
+static void imu_sensor_task(void *arg)
+{
+    s_imu_task_handle = xTaskGetCurrentTaskHandle();
+    uint8_t raw[14];
+    float pitch = 0.0f, roll = 0.0f;
+    int64_t last_us = esp_timer_get_time();
+
+    while (1) {
+        // 10 ms fallback timeout prevents deadlock if an edge is missed during flash ops
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
+        int64_t now_us = esp_timer_get_time();
+        float dt = (now_us - last_us) * 1e-6f;
+        last_us = now_us;
+        if (dt <= 0.0f || dt > 0.05f) dt = 0.002f;
+
+        mpu6500_read_burst(MPU_REG_ACCEL_XOUT_H, raw, 14);
+
+        int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
+        int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
+        int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
+        int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
+        int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
+        int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
+
+        // Scale: +-4g -> 8192 LSB/g, +-500 dps -> 65.5 LSB/(deg/s)
+        float fax = ax / 8192.0f, fay = ay / 8192.0f, faz = az / 8192.0f;
+        float fgx = gx / 65.5f,   fgy = gy / 65.5f,   fgz = gz / 65.5f;
+
+        // 6-DOF Complementary Filter (98% gyro, 2% accel)
+        float acc_pitch = atan2f(fay, sqrtf(fax * fax + faz * faz)) * 57.29578f;
+        float acc_roll  = atan2f(-fax, faz) * 57.29578f;
+        pitch = 0.98f * (pitch + fgx * dt) + 0.02f * acc_pitch;
+        roll  = 0.98f * (roll  + fgy * dt) + 0.02f * acc_roll;
+
+        // Gimbal-guarded cursor delta mapping (attenuate roll comp near +-90 deg pitch)
+        float cos_p = cosf(pitch * 0.0174533f);
+        if (cos_p < 0.2f) cos_p = 0.2f;
+        int32_t dx = (int32_t)(-fgz * cos_p * 0.35f);
+        int32_t dy = (int32_t)(-fgy * 0.35f);
+
+        portENTER_CRITICAL(&s_state_spinlock);
+        s_state.pitch_deg = pitch;
+        s_state.roll_deg  = roll;
+        s_state.drdy_count++;
+        if (s_state.active_mode) {
+            s_state.acc_dx += dx;
+            s_state.acc_dy += dy;
+        }
+        portEXIT_CRITICAL(&s_state_spinlock);
+    }
+}
+
+/* =========================================================================
+ * 7. CORE 1 POWER-GATED JOYSTICK & MODE TASK (Prio 6, 50 Hz)
+ * ========================================================================= */
+static void input_poll_init(void)
+{
+    // Power-gate GPIO (default LOW = 0 uA pot draw)
+    gpio_config_t gate_cfg = {
+        .pin_bit_mask = (1ULL << PIN_JOY_VCC_GATE),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&gate_cfg);
+    gpio_set_level(PIN_JOY_VCC_GATE, 0);
+
+    // Mode toggle switch (active-low with internal pull-up)
+    gpio_config_t sw_cfg = {
+        .pin_bit_mask = (1ULL << PIN_JOY_SW),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&sw_cfg);
+
+    // ADC Oneshot setup (ESP-IDF v6+ API)
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = JOY_ADC_UNIT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, JOY_ADC_CHANNEL, &chan_cfg));
+}
+
+static void input_poll_task(void *arg)
+{
+    int last_sw = 1;
+
+    while (1) {
+        // 1. Pulse Joystick VCC rail for 50 us, sample ADC, cut power immediately
+        gpio_set_level(PIN_JOY_VCC_GATE, 1);
+        esp_rom_delay_us(50);
+
+        int raw_y = 2048;
+        adc_oneshot_read(s_adc_handle, JOY_ADC_CHANNEL, &raw_y);
+        gpio_set_level(PIN_JOY_VCC_GATE, 0);
+
+        // Deadzone around center (~2048) -> map to -5..+5 scroll ticks
+        int8_t scroll = 0;
+        int diff = raw_y - 2048;
+        if (diff > 350)       scroll = (int8_t)((diff - 350) / 300 + 1);
+        else if (diff < -350) scroll = (int8_t)((diff + 350) / 300 - 1);
+
+        // 2. Poll Mode Toggle Switch (falling edge toggles Active vs Typing Locked)
+        int sw = gpio_get_level(PIN_JOY_SW);
+        bool toggled = (last_sw == 1 && sw == 0);
+        last_sw = sw;
+
+        portENTER_CRITICAL(&s_state_spinlock);
+        s_state.scroll_y = scroll;
+        if (toggled) {
+            s_state.active_mode = !s_state.active_mode;
+            s_state.acc_dx = 0;
+            s_state.acc_dy = 0;
+        }
+        portEXIT_CRITICAL(&s_state_spinlock);
+
+        vTaskDelay(pdMS_TO_TICKS(20)); // 50 Hz
+    }
+}
+
+/* =========================================================================
+ * 8. CORE 1 SSD1306 I2C OLED UI TASK (Prio 2)
+ * ========================================================================= */
+static void oled_ui_init(void)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = PIN_OLED_SDA,
+        .scl_io_num = PIN_OLED_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t i2c_bus = NULL;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
+
+    esp_lcd_panel_io_i2c_config_t io_cfg = {
+        .dev_addr = OLED_I2C_ADDR,
+        .scl_speed_hz = 400000,
+        .control_phase_bytes = 1,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .dc_bit_offset = 6,
+    };
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus, &io_cfg, &io_handle));
+
+    esp_lcd_panel_ssd1306_config_t ssd1306_cfg = { .height = 64 };
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .bits_per_pixel = 1,
+        .reset_gpio_num = -1,
+        .vendor_config = &ssd1306_cfg,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io_handle, &panel_cfg, &s_oled_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_oled_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_oled_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_oled_panel, true));
+}
+
+static void oled_ui_task(void *arg)
+{
+    static uint8_t fb[128 * 64 / 8]; // 1 KB monochrome page framebuffer
+
+    while (1) {
+        system_state_t snap;
+        portENTER_CRITICAL(&s_state_spinlock);
+        snap = s_state;
+        portEXIT_CRITICAL(&s_state_spinlock);
+
+        memset(fb, 0x00, sizeof(fb));
+
+        // Visual bring-up bar indicators on SSD1306 (Page 0: Mode, Page 2: Pitch, Page 4: Roll, Page 6: Scroll)
+        // Page 0: Solid top bar if ACTIVE_MODE, dashed if TYPING_LOCKED
+        for (int x = 0; x < 128; x++) {
+            fb[x] = snap.active_mode ? 0xFF : ((x % 4 < 2) ? 0x3C : 0x00);
+        }
+
+        // Page 2 (offset 256): Pitch bar centered at x=64
+        int p_x = 64 + (int)(snap.pitch_deg * 0.7f);
+        if (p_x < 0) p_x = 0;
+        if (p_x > 120) p_x = 120;
+        for (int i = 0; i < 8; i++) fb[2 * 128 + p_x + i] = 0x7E;
+
+        // Page 4 (offset 512): Roll bar centered at x=64
+        int r_x = 64 + (int)(snap.roll_deg * 0.7f);
+        if (r_x < 0) r_x = 0;
+        if (r_x > 120) r_x = 120;
+        for (int i = 0; i < 8; i++) fb[4 * 128 + r_x + i] = 0x7E;
+
+        // Page 6 (offset 768): Scroll bar centered at x=64
+        int s_x = 64 + (snap.scroll_y * 10);
+        if (s_x < 0) s_x = 0;
+        if (s_x > 120) s_x = 120;
+        for (int i = 0; i < 8; i++) fb[6 * 128 + s_x + i] = 0xFF;
+
+        esp_lcd_panel_draw_bitmap(s_oled_panel, 0, 0, 128, 64, fb);
+        vTaskDelay(pdMS_TO_TICKS(100)); // 10 Hz UI refresh
+    }
+}
+
+/* =========================================================================
+ * 9. CORE 0 BLE HID TX / TELEMETRY STUB (10 ms Cadence)
+ * ========================================================================= */
+static void ble_hid_tx_task(void *arg)
+{
+    uint32_t tick = 0;
+    while (1) {
+        int32_t dx = 0, dy = 0;
+        int8_t scroll = 0;
+        float pitch = 0.0f, roll = 0.0f;
+        bool active = false;
+        uint32_t drdy = 0;
+
+        // Atomically consume accumulated cursor deltas at 100 Hz (10 ms)
+        portENTER_CRITICAL(&s_state_spinlock);
+        dx = s_state.acc_dx;
+        dy = s_state.acc_dy;
+        s_state.acc_dx = 0;
+        s_state.acc_dy = 0;
+        scroll = s_state.scroll_y;
+        pitch  = s_state.pitch_deg;
+        roll   = s_state.roll_deg;
+        active = s_state.active_mode;
+        drdy   = s_state.drdy_count;
+        portEXIT_CRITICAL(&s_state_spinlock);
+
+        // TODO: Send NimBLE HID Mouse Input Report (buttons, clamp(dx), clamp(dy), scroll)
+        // Log telemetry every 250 ms for bench verification
+        if ((++tick % 25) == 0) {
+            ESP_LOGI(TAG, "[%s] DRDY=%lu | Pitch=%6.1f Roll=%6.1f | dX=%ld dY=%ld Scroll=%d",
+                     active ? "ACTIVE" : "LOCKED",
+                     (unsigned long)drdy, pitch, roll,
+                     (long)dx, (long)dy, scroll);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* =========================================================================
+ * 10. ENTRY POINT
+ * ========================================================================= */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Initializing Air Mouse Hardware Bring-Up Demo...");
+
+    oled_ui_init();
+    input_poll_init();
+    gpspi2_baremetal_init();
+
+    if (mpu6500_init() != ESP_OK) {
+        ESP_LOGE(TAG, "MPU6500 init failed! Check SPI wiring (MOSI=11, SCLK=12, MISO=13, nCS=10).");
+    }
+
+    // Core 1: Real-time sensors & UI
+    xTaskCreatePinnedToCore(imu_sensor_task, "imu_sensor", 4096, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(input_poll_task, "input_poll", 3072, NULL,  6, NULL, 1);
+    xTaskCreatePinnedToCore(oled_ui_task,    "oled_ui",    4096, NULL,  2, NULL, 1);
+
+    // Core 0: BLE HID report cadence
+    xTaskCreatePinnedToCore(ble_hid_tx_task, "ble_hid_tx", 4096, NULL,  5, NULL, 0);
+}
